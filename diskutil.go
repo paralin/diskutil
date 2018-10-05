@@ -2,9 +2,9 @@ package diskutil
 
 // DeviceDescriptor is an element in the storage devices list.
 type DeviceDescriptor struct {
-	// Enumerator is the enumerator that discovered this device.
-	// Ex: SCSI, USBSTOR
-	Enumerator string
+	// InterfaceType is the interface type of this device.
+	// Possibly: USB
+	InterfaceType string
 	// BusType is the bus type of this device.
 	BusType string
 	// BusVersion is the bus version of this device.

@@ -1,3 +1,5 @@
+//+build windows,no_wmi
+
 package diskutil
 
 import (
