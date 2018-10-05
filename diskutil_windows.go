@@ -1,18 +1,23 @@
 package diskutil
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/text/encoding/unicode"
 )
 
 // Implicit windows only build tag.
 
 var (
 	kernel32            = syscall.NewLazyDLL("kernel32.dll")
-	procCreateFileA     = kernel32.NewProc("CreateFileA")
+	procCreateFileW     = kernel32.NewProc("CreateFileW")
 	procDeviceIoControl = kernel32.NewProc("DeviceIoControl")
 
 	modsetupapi = syscall.NewLazyDLL("setupapi.dll")
@@ -22,7 +27,7 @@ var (
 	procSetupDiDestroyDeviceInfoList      = modsetupapi.NewProc("SetupDiDestroyDeviceInfoList")
 	procSetupDiGetDeviceRegistryPropertyA = modsetupapi.NewProc("SetupDiGetDeviceRegistryPropertyA")
 	procSetupDiEnumDeviceInterfaces       = modsetupapi.NewProc("SetupDiEnumDeviceInterfaces")
-	procSetupDiGetDeviceInterfaceDetailA  = modsetupapi.NewProc("SetupDiGetDeviceInterfaceDetailA")
+	procSetupDiGetDeviceInterfaceDetailW  = modsetupapi.NewProc("SetupDiGetDeviceInterfaceDetailW")
 )
 
 // ListStorageDevices lists all connected storage devices.
@@ -168,7 +173,7 @@ func setupDiGetDeviceInterfaceDetail(
 	// Determine how large the result needs to be
 	var cbSize uint
 	_, _, e1 := syscall.Syscall6(
-		procSetupDiGetDeviceInterfaceDetailA.Addr(),
+		procSetupDiGetDeviceInterfaceDetailW.Addr(),
 		6,
 		uintptr(deviceInfoSet),
 		uintptr(unsafe.Pointer(deviceInterfaceData)),
@@ -193,7 +198,7 @@ func setupDiGetDeviceInterfaceDetail(
 	// *cbSizePtr = uint32(uintSize + 1)
 
 	_, _, e1 = syscall.Syscall6(
-		procSetupDiGetDeviceInterfaceDetailA.Addr(),
+		procSetupDiGetDeviceInterfaceDetailW.Addr(),
 		6,
 		uintptr(deviceInfoSet),
 		uintptr(unsafe.Pointer(deviceInterfaceData)),
@@ -208,12 +213,21 @@ func setupDiGetDeviceInterfaceDetail(
 		return "", nil, error(e1)
 	}
 
-	devicePath := string(data[uintSize:])
-	if nilIdx := strings.IndexRune(devicePath, rune(0)); nilIdx != -1 {
-		devicePath = devicePath[:nilIdx]
+	// convert from wide char
+	dec := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
+	dataSlice := data[uintSize-4:]
+	out, err := dec.Bytes(dataSlice)
+	if err != nil {
+		return "", nil, err
 	}
 
-	return devicePath, data[uintSize:], nil
+	i := bytes.IndexByte(out, 0)
+	if i == -1 {
+		i = len(out)
+	}
+
+	devicePath := string(out[:i])
+	return devicePath, dataSlice, nil
 }
 
 // getDriveDetail returns details about the drive to the descriptor.
@@ -241,41 +255,39 @@ func getDriveDetail(descrip *DeviceDescriptor, di syscall.Handle, did *spDeviceI
 		if err != nil {
 			return err
 		}
-		_ = devicePathBin
+		// _ = devicePathBin
 		descrip.DevicePath = devicePath
 
-		/*
-			hDeviceRet, _, lastErr := syscall.Syscall9(
-				procCreateFileA.Addr(),
-				7,
-				uintptr(unsafe.Pointer(&devicePathBin[0])),
-				uintptr(0),
-				uintptr(syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE),
-				uintptr(0),
-				uintptr(syscall.OPEN_EXISTING),
-				uintptr(syscall.FILE_ATTRIBUTE_NORMAL),
-				uintptr(0),
-				uintptr(0), uintptr(0),
-			)
-			hDevice = syscall.Handle(hDeviceRet)
-			if hDevice == syscall.InvalidHandle {
-				fmt.Printf("%v\n", devicePathBin)
-				descrip.Error = "Cannot open handle to device"
-				if lastErr != 0 {
-					descrip.Error += ": " + lastErr.Error()
-				}
-				break
+		hDeviceRet, _, lastErr := syscall.Syscall9(
+			procCreateFileW.Addr(),
+			7,
+			uintptr(unsafe.Pointer(&devicePathBin[0])),
+			uintptr(0),
+			uintptr(syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE),
+			uintptr(0),
+			uintptr(syscall.OPEN_EXISTING),
+			uintptr(syscall.FILE_ATTRIBUTE_NORMAL),
+			uintptr(0),
+			uintptr(0), uintptr(0),
+		)
+		hDevice = syscall.Handle(hDeviceRet)
+		if hDevice == syscall.InvalidHandle {
+			fmt.Printf("%v\n", devicePathBin)
+			descrip.Error = "Cannot open handle to device"
+			if lastErr != 0 {
+				descrip.Error += ": " + lastErr.Error()
 			}
+			break
+		}
 
-			deviceNumber, err := getDeviceNumber(hDevice)
-			if err != nil {
-				descrip.Error = err.Error()
-				break
-			}
+		deviceNumber, err := getDeviceNumber(hDevice)
+		if err != nil {
+			descrip.Error = err.Error()
+			break
+		}
 
-			descrip.Raw = "\\\\.\\PhysicalDrive" + strconv.Itoa(int(deviceNumber))
-			descrip.Device = descrip.Raw
-		*/
+		descrip.Raw = "\\\\.\\PhysicalDrive" + strconv.Itoa(int(deviceNumber))
+		descrip.Device = descrip.Raw
 	}
 	return nil
 }
@@ -307,7 +319,7 @@ type storageDeviceNumber struct {
 	DeviceNumber, PartitionNumber uint32
 }
 
-func getDeviceNumber(devHandle syscall.Handle) (int32, error) {
+func getDeviceNumber(devHandle syscall.Handle) (uint32, error) {
 	var sdn storageDeviceNumber
 	var size uint32
 	ret, _, errNo := syscall.Syscall9(
@@ -329,7 +341,7 @@ func getDeviceNumber(devHandle syscall.Handle) (int32, error) {
 		return 0, error(errNo)
 	}
 
-	return int32(ret), nil
+	return sdn.DeviceNumber, nil
 }
 
 // getEnumeratorName retreives the enumerator name of the device.
