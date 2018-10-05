@@ -1,6 +1,8 @@
 package diskutil
 
 import (
+	"encoding/binary"
+	"errors"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -9,12 +11,18 @@ import (
 // Implicit windows only build tag.
 
 var (
+	kernel32            = syscall.NewLazyDLL("kernel32.dll")
+	procCreateFileA     = kernel32.NewProc("CreateFileA")
+	procDeviceIoControl = kernel32.NewProc("DeviceIoControl")
+
 	modsetupapi = syscall.NewLazyDLL("setupapi.dll")
 
 	procSetupDiGetClassDevsW              = modsetupapi.NewProc("SetupDiGetClassDevsW")
 	procSetupDiEnumDeviceInfo             = modsetupapi.NewProc("SetupDiEnumDeviceInfo")
 	procSetupDiDestroyDeviceInfoList      = modsetupapi.NewProc("SetupDiDestroyDeviceInfoList")
 	procSetupDiGetDeviceRegistryPropertyA = modsetupapi.NewProc("SetupDiGetDeviceRegistryPropertyA")
+	procSetupDiEnumDeviceInterfaces       = modsetupapi.NewProc("SetupDiEnumDeviceInterfaces")
+	procSetupDiGetDeviceInterfaceDetailA  = modsetupapi.NewProc("SetupDiGetDeviceInterfaceDetailA")
 )
 
 // ListStorageDevices lists all connected storage devices.
@@ -63,6 +71,10 @@ func ListStorageDevices() ([]*DeviceDescriptor, error) {
 		descrip.LogicalBlockSize = 512
 		descrip.BlockSize = 512
 
+		if err := getDriveDetail(descrip, retHandle, &did); err != nil {
+			descrip.Error = err.Error()
+		}
+
 		res = append(res, descrip)
 	}
 
@@ -103,6 +115,221 @@ func enumDeviceInfo(di syscall.Handle, memberIndex uint32) (*spDeviceInformation
 		return nil, err
 	}
 	return &did, nil
+}
+
+type spDeviceInterfaceData struct {
+	CbSize             uint32
+	InterfaceClassGuid GUID
+	Flags              uint32
+	Reserved           uint
+}
+
+func setupDiEnumDeviceInterfaces(
+	deviceInfoSet syscall.Handle,
+	deviceInfoData *spDeviceInformationData,
+	deviceInterfaceClassGUID *GUID,
+	memberIndex uint32,
+) (*spDeviceInterfaceData, error) {
+	var deviceInterData spDeviceInterfaceData
+	deviceInterData.CbSize = uint32(unsafe.Sizeof(deviceInterData))
+	r1, _, e1 := syscall.Syscall6(
+		procSetupDiEnumDeviceInterfaces.Addr(),
+		5,
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+		uintptr(unsafe.Pointer(deviceInterfaceClassGUID)),
+		uintptr(memberIndex),
+		uintptr(unsafe.Pointer(&deviceInterData)),
+		uintptr(0),
+	)
+	if r1 == 0 {
+		// ERR_NO_MORE_ITEMS
+		if e1 == 259 {
+			if memberIndex == 0 {
+				return nil, errors.New("no device interfaces")
+			} else {
+				return nil, nil
+			}
+		} else if e1 != 0 {
+			return nil, error(e1)
+		} else {
+			return nil, syscall.EINVAL
+		}
+	}
+
+	return &deviceInterData, nil
+}
+
+// setupDiGetDeviceInterfaceDetail returns the device path if known and/or error
+func setupDiGetDeviceInterfaceDetail(
+	deviceInfoSet syscall.Handle,
+	deviceInterfaceData *spDeviceInterfaceData,
+) (string, []byte, error) {
+	// Determine how large the result needs to be
+	var cbSize uint
+	_, _, e1 := syscall.Syscall6(
+		procSetupDiGetDeviceInterfaceDetailA.Addr(),
+		6,
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInterfaceData)),
+		uintptr(0),
+		uintptr(0),
+		uintptr(unsafe.Pointer(&cbSize)),
+		uintptr(0),
+	)
+	if e1 != 0 && e1 != 122 {
+		return "", nil, error(e1)
+	}
+
+	// Result is 4 bytes cbSize + result string + 1 byte
+	uintSize := int(unsafe.Sizeof(cbSize))
+	data := make([]byte, cbSize)
+	cbSizePtr := (*uint32)(unsafe.Pointer(&data[0]))
+	if uintSize == 8 {
+		*cbSizePtr = 8
+	} else {
+		*cbSizePtr = 6
+	}
+	// *cbSizePtr = uint32(uintSize + 1)
+
+	_, _, e1 = syscall.Syscall6(
+		procSetupDiGetDeviceInterfaceDetailA.Addr(),
+		6,
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInterfaceData)),
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(cbSize),
+		uintptr(unsafe.Pointer(&cbSize)),
+		// uintptr(cbSize),
+		// uintptr(unsafe.Pointer(&cbSize)),
+		uintptr(0),
+	)
+	if e1 != 0 {
+		return "", nil, error(e1)
+	}
+
+	devicePath := string(data[uintSize:])
+	if nilIdx := strings.IndexRune(devicePath, rune(0)); nilIdx != -1 {
+		devicePath = devicePath[:nilIdx]
+	}
+
+	return devicePath, data[uintSize:], nil
+}
+
+// getDriveDetail returns details about the drive to the descriptor.
+func getDriveDetail(descrip *DeviceDescriptor, di syscall.Handle, did *spDeviceInformationData) error {
+	var hDevice, hPhysical syscall.Handle = syscall.InvalidHandle, syscall.InvalidHandle
+	for i := 0; true; i++ {
+		if hDevice != syscall.InvalidHandle {
+			_ = syscall.CloseHandle(hDevice)
+			hDevice = syscall.InvalidHandle
+		}
+		if hPhysical != syscall.InvalidHandle {
+			_ = syscall.CloseHandle(hPhysical)
+			hPhysical = syscall.InvalidHandle
+		}
+
+		deviceInterData, err := setupDiEnumDeviceInterfaces(di, did, GUID_DEVINTERFACE_DISK, uint32(i))
+		if err != nil {
+			return err
+		}
+		if deviceInterData == nil {
+			break
+		}
+
+		devicePath, devicePathBin, err := setupDiGetDeviceInterfaceDetail(di, deviceInterData)
+		if err != nil {
+			return err
+		}
+		_ = devicePathBin
+		descrip.DevicePath = devicePath
+
+		/*
+			hDeviceRet, _, lastErr := syscall.Syscall9(
+				procCreateFileA.Addr(),
+				7,
+				uintptr(unsafe.Pointer(&devicePathBin[0])),
+				uintptr(0),
+				uintptr(syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE),
+				uintptr(0),
+				uintptr(syscall.OPEN_EXISTING),
+				uintptr(syscall.FILE_ATTRIBUTE_NORMAL),
+				uintptr(0),
+				uintptr(0), uintptr(0),
+			)
+			hDevice = syscall.Handle(hDeviceRet)
+			if hDevice == syscall.InvalidHandle {
+				fmt.Printf("%v\n", devicePathBin)
+				descrip.Error = "Cannot open handle to device"
+				if lastErr != 0 {
+					descrip.Error += ": " + lastErr.Error()
+				}
+				break
+			}
+
+			deviceNumber, err := getDeviceNumber(hDevice)
+			if err != nil {
+				descrip.Error = err.Error()
+				break
+			}
+
+			descrip.Raw = "\\\\.\\PhysicalDrive" + strconv.Itoa(int(deviceNumber))
+			descrip.Device = descrip.Raw
+		*/
+	}
+	return nil
+}
+
+type diskExtent struct {
+	DiskNumber     uint32
+	StartingOffset uint64
+	ExtentLength   uint64
+}
+
+type volumeDiskExtents []byte
+
+func (v *volumeDiskExtents) Len() uint {
+	return uint(binary.LittleEndian.Uint32([]byte(*v)))
+}
+
+func (v *volumeDiskExtents) Extent(n uint) diskExtent {
+	ba := []byte(*v)
+	offset := 8 + 24*n
+	return diskExtent{
+		DiskNumber:     binary.LittleEndian.Uint32(ba[offset:]),
+		StartingOffset: binary.LittleEndian.Uint64(ba[offset+8:]),
+		ExtentLength:   binary.LittleEndian.Uint64(ba[offset+16:]),
+	}
+}
+
+type storageDeviceNumber struct {
+	DeviceType                    uint64
+	DeviceNumber, PartitionNumber uint32
+}
+
+func getDeviceNumber(devHandle syscall.Handle) (int32, error) {
+	var sdn storageDeviceNumber
+	var size uint32
+	ret, _, errNo := syscall.Syscall9(
+		procDeviceIoControl.Addr(),
+		8,
+		uintptr(devHandle),
+		// IOCTL_STORAGE_GET_DEVICE_NUMBER
+		uintptr(0x2D1080),
+		uintptr(0),
+		uintptr(0),
+		// ptr to disk extents
+		uintptr(unsafe.Pointer(&sdn)),
+		uintptr(unsafe.Sizeof(sdn)),
+		uintptr(unsafe.Pointer(&size)),
+		uintptr(0),
+		uintptr(0),
+	)
+	if ret == 0 {
+		return 0, error(errNo)
+	}
+
+	return int32(ret), nil
 }
 
 // getEnumeratorName retreives the enumerator name of the device.
